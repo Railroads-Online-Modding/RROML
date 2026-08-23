@@ -4,11 +4,6 @@ using RROML.Abstractions;
 
 namespace ExampleMod
 {
-    /// <summary>
-    /// ExampleMod - minimal C# mod for RROML v1.2.0.
-    /// Mirrors ExampleLuaMod/main.lua but in C#.
-    /// Build via tools/build-managed.bat, installed to Mods/ExampleMod/.
-    /// </summary>
     public sealed class ExampleMod : IRromlMod
     {
         public string Id { get { return "ExampleMod"; } }
@@ -20,22 +15,18 @@ namespace ExampleMod
             var log = context.Logger;
 
             log.Info("[" + Name + " v" + Version + "] OnLoad called");
-
-            // Paths exposed by RROML
             log.Info("  Game root : " + context.GameRootPath);
             log.Info("  Loader path: " + context.LoaderPath);
             log.Info("  Mods path  : " + context.ModsPath);
             log.Info("  Mod id     : " + Id);
             log.Info("  Mod version: " + Version);
 
-            // Config helpers
             var myConfig = context.GetConfigPath("settings.json");
             var userConfig = context.GetUserGameConfigPath("Engine.ini");
             log.Info("  My config path  : " + myConfig);
             log.Info("  User game config: " + userConfig);
             log.Info("  Config folder   : " + Path.GetDirectoryName(myConfig));
 
-            // Example: write a default config if not exists
             try
             {
                 if (!File.Exists(myConfig))
@@ -64,7 +55,6 @@ namespace ExampleMod
                 log.Error("Config error details", ex);
             }
 
-            // Standard C# features demo
             var sum = 0;
             for (var i = 1; i <= 5; i++) sum += i;
             log.Info("  C# loop test sum 1..5 = " + sum);
