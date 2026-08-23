@@ -33,8 +33,9 @@ RROML is a mod loader for the game Railroads Online! It makes it so that the com
 
 **Information:**
 - RROML is coded in C++ & C#
-- Mods are coded in C# (Possibility of using another coding language in the future)
+- Mods are coded in C# and **Lua** (since v1.2.0, via MoonSharp Lua 5.2)
 - Compiling uses Batchfiles (.bat) and C# / C++ compilers, or any other means of compilation of C# & C++ code
+- Lua mods do **not** require compilation – just drop a `main.lua` (+ `mod.json` with `EntryLua`) into `Mods/YourMod/` or a single `Mods/YourMod.lua`
 
 ---
 

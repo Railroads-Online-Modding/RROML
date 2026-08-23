@@ -7,6 +7,7 @@ namespace RROML.Core
         public string Id { get; set; }
         public string Name { get; set; }
         public string EntryDll { get; set; }
+        public string EntryLua { get; set; }
         public string Version { get; set; }
         public List<string> Dependencies { get; set; }
 

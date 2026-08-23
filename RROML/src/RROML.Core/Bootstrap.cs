@@ -43,7 +43,7 @@ namespace RROML.Core
 
                 var logPath = Path.Combine(logsPath, "rroml.log");
                 logger = new FileLogger(logPath);
-                logger.Info("RROML bootstrap starting.");
+                logger.Info("RROML bootstrap starting. Version " + RROMLVersion.Version + " (" + RROMLVersion.Engine + " Lua " + RROMLVersion.LuaVersion + ")");
                 logger.Info("Game root: " + gameRoot);
                 logger.Info("Loader path: " + loaderPath);
                 logger.Info("Mods path: " + modsPath);

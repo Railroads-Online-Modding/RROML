@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using RROML.Abstractions;
+using RROML.Core.Lua;
 
 namespace RROML.Core
 {
@@ -40,7 +41,8 @@ namespace RROML.Core
                 catch (Exception exception)
                 {
                     summary.FailedModCount++;
-                    _logger.Error("Failed to load mod assembly: " + candidate.AssemblyPath, exception);
+                    var path = candidate.Kind == ModKind.Lua ? candidate.LuaPath : candidate.AssemblyPath;
+                    _logger.Error("Failed to load mod: " + path, exception);
                 }
             }
 
@@ -62,6 +64,18 @@ namespace RROML.Core
                 {
                     ModRoot = _modsPath,
                     AssemblyPath = dllPath,
+                    Kind = ModKind.Dll,
+                    Manifest = null
+                });
+            }
+
+            foreach (var luaPath in Directory.GetFiles(_modsPath, "*.lua", SearchOption.TopDirectoryOnly))
+            {
+                result.Add(new ModCandidate
+                {
+                    ModRoot = _modsPath,
+                    LuaPath = luaPath,
+                    Kind = ModKind.Lua,
                     Manifest = null
                 });
             }
@@ -70,40 +84,108 @@ namespace RROML.Core
             {
                 var manifestPath = Path.Combine(directory, "mod.json");
                 var manifest = SimpleJson.ReadFile<ModManifest>(manifestPath);
-                if (manifest == null || string.IsNullOrWhiteSpace(manifest.EntryDll))
+                bool handled = false;
+
+                if (manifest != null)
                 {
-                    var guessedDll = Directory.GetFiles(directory, "*.dll", SearchOption.TopDirectoryOnly).FirstOrDefault();
-                    if (guessedDll == null)
+                    bool hasDll = !string.IsNullOrWhiteSpace(manifest.EntryDll);
+                    bool hasLua = !string.IsNullOrWhiteSpace(manifest.EntryLua);
+
+                    if (hasLua && hasDll)
                     {
-                        _logger.Warn("Skipping folder with no mod.json entry DLL and no top-level DLL: " + directory);
+                        _logger.Warn("Folder " + directory + " defines both EntryDll and EntryLua. Loading both.");
+                    }
+
+                    if (hasLua)
+                    {
+                        var luaCandidate = TryCreateLuaCandidate(directory, manifest, manifest.EntryLua);
+                        if (luaCandidate != null)
+                        {
+                            result.Add(luaCandidate);
+                            handled = true;
+                        }
+                    }
+
+                    if (hasDll)
+                    {
+                        var dllCandidate = TryCreateDllCandidate(directory, manifest, manifest.EntryDll);
+                        if (dllCandidate != null)
+                        {
+                            result.Add(dllCandidate);
+                            handled = true;
+                        }
+                    }
+
+                    if (handled)
+                    {
                         continue;
                     }
 
-                    result.Add(new ModCandidate
-                    {
-                        ModRoot = directory,
-                        AssemblyPath = guessedDll,
-                        Manifest = manifest
-                    });
+                    // Manifest exists but no valid entry -> guess
+                    _logger.Warn("Manifest in " + directory + " has no valid EntryDll or EntryLua. Attempting to guess entry.");
+                }
+
+                // No manifest or guess fallback: try to find any dll or lua
+                var guessedDll = Directory.GetFiles(directory, "*.dll", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                var guessedLua = FindGuessedLua(directory);
+
+                if (guessedDll != null && guessedLua != null)
+                {
+                    // Prefer to add both as separate candidates with different ids (file name based)
+                    result.Add(new ModCandidate { ModRoot = directory, AssemblyPath = guessedDll, Kind = ModKind.Dll, Manifest = manifest });
+                    result.Add(new ModCandidate { ModRoot = directory, LuaPath = guessedLua, Kind = ModKind.Lua, Manifest = manifest });
                     continue;
                 }
 
-                var assemblyPath = Path.Combine(directory, manifest.EntryDll);
-                if (!File.Exists(assemblyPath))
+                if (guessedDll != null)
                 {
-                    _logger.Warn("Skipping folder mod because entry DLL is missing: " + assemblyPath);
+                    result.Add(new ModCandidate { ModRoot = directory, AssemblyPath = guessedDll, Kind = ModKind.Dll, Manifest = manifest });
                     continue;
                 }
 
-                result.Add(new ModCandidate
+                if (guessedLua != null)
                 {
-                    ModRoot = directory,
-                    AssemblyPath = assemblyPath,
-                    Manifest = manifest
-                });
+                    result.Add(new ModCandidate { ModRoot = directory, LuaPath = guessedLua, Kind = ModKind.Lua, Manifest = manifest });
+                    continue;
+                }
+
+                _logger.Warn("Skipping folder with no mod.json entry and no top-level DLL/Lua: " + directory);
             }
 
             return result;
+        }
+
+        private ModCandidate TryCreateLuaCandidate(string directory, ModManifest manifest, string entryLua)
+        {
+            var luaPath = Path.Combine(directory, entryLua);
+            if (!File.Exists(luaPath))
+            {
+                _logger.Warn("Skipping folder Lua mod because entry Lua is missing: " + luaPath);
+                return null;
+            }
+            return new ModCandidate { ModRoot = directory, LuaPath = luaPath, Kind = ModKind.Lua, Manifest = manifest };
+        }
+
+        private ModCandidate TryCreateDllCandidate(string directory, ModManifest manifest, string entryDll)
+        {
+            var dllPath = Path.Combine(directory, entryDll);
+            if (!File.Exists(dllPath))
+            {
+                _logger.Warn("Skipping folder mod because entry DLL is missing: " + dllPath);
+                return null;
+            }
+            return new ModCandidate { ModRoot = directory, AssemblyPath = dllPath, Kind = ModKind.Dll, Manifest = manifest };
+        }
+
+        private static string FindGuessedLua(string directory)
+        {
+            var candidates = new[] { "main.lua", "init.lua", "mod.lua" };
+            foreach (var name in candidates)
+            {
+                var path = Path.Combine(directory, name);
+                if (File.Exists(path)) return path;
+            }
+            return Directory.GetFiles(directory, "*.lua", SearchOption.TopDirectoryOnly).FirstOrDefault();
         }
 
         private List<ModCandidate> OrderCandidates(List<ModCandidate> candidates)
@@ -172,12 +254,13 @@ namespace RROML.Core
 
         private int LoadOne(ModCandidate candidate)
         {
-            var loadedCount = 0;
             var candidateId = GetCandidateId(candidate);
-            var assemblyFileName = Path.GetFileNameWithoutExtension(candidate.AssemblyPath);
-            if (IsDisabled(candidate, assemblyFileName) || IsDisabled(candidate, candidateId))
+            var displayName = candidate.Kind == ModKind.Lua ? candidate.LuaPath : candidate.AssemblyPath;
+            var fileNameWithoutExt = Path.GetFileNameWithoutExtension(displayName ?? candidateId);
+
+            if (IsDisabled(candidate, fileNameWithoutExt) || IsDisabled(candidate, candidateId))
             {
-                _logger.Info("Skipping disabled mod: " + assemblyFileName);
+                _logger.Info("Skipping disabled mod: " + fileNameWithoutExt + " (" + candidateId + ")");
                 return 0;
             }
 
@@ -190,6 +273,18 @@ namespace RROML.Core
                 return 0;
             }
 
+            if (candidate.Kind == ModKind.Lua)
+            {
+                return LoadLuaOne(candidate, candidateId);
+            }
+
+            return LoadDllOne(candidate, candidateId);
+        }
+
+        private int LoadDllOne(ModCandidate candidate, string candidateId)
+        {
+            var loadedCount = 0;
+            var assemblyFileName = Path.GetFileNameWithoutExtension(candidate.AssemblyPath);
             var assembly = Assembly.LoadFrom(candidate.AssemblyPath);
             var modTypes = assembly.GetTypes()
                 .Where(type => typeof(IRromlMod).IsAssignableFrom(type) && !type.IsAbstract && type.IsClass)
@@ -233,6 +328,22 @@ namespace RROML.Core
             return loadedCount;
         }
 
+        private int LoadLuaOne(ModCandidate candidate, string candidateId)
+        {
+            var safeName = SanitizeName(candidate.Manifest != null && !string.IsNullOrWhiteSpace(candidate.Manifest.Id) ? candidate.Manifest.Id : candidateId);
+            var configRoot = Path.Combine(_loaderPath, "Configs", safeName);
+            var context = new ModContext(_gameRootPath, _loaderPath, _modsPath, configRoot, _logger);
+
+            if (IsDisabled(candidate, safeName))
+            {
+                _logger.Info("Skipping disabled Lua mod instance: " + safeName);
+                return 0;
+            }
+
+            var success = LuaModRunner.Run(candidate, context, _logger);
+            return success ? 1 : 0;
+        }
+
         private IEnumerable<string> GetDependencies(ModCandidate candidate)
         {
             if (candidate.Manifest == null || candidate.Manifest.Dependencies == null)
@@ -265,7 +376,38 @@ namespace RROML.Core
                 return candidate.Manifest.Id;
             }
 
-            return Path.GetFileNameWithoutExtension(candidate.AssemblyPath);
+            if (candidate.Kind == ModKind.Lua && !string.IsNullOrWhiteSpace(candidate.LuaPath))
+            {
+                var fileName = Path.GetFileNameWithoutExtension(candidate.LuaPath);
+                if (IsGenericLuaFileName(fileName) && !string.IsNullOrWhiteSpace(candidate.ModRoot))
+                {
+                    var folderName = Path.GetFileName(candidate.ModRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                    if (!string.IsNullOrWhiteSpace(folderName) && !string.Equals(folderName, "Mods", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return folderName;
+                    }
+                }
+                return fileName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidate.AssemblyPath))
+            {
+                return Path.GetFileNameWithoutExtension(candidate.AssemblyPath);
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidate.LuaPath))
+            {
+                return Path.GetFileNameWithoutExtension(candidate.LuaPath);
+            }
+
+            return "UnknownMod";
+        }
+
+        private static bool IsGenericLuaFileName(string fileName)
+        {
+            return string.Equals(fileName, "main", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(fileName, "init", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(fileName, "mod", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string SanitizeName(string value)
