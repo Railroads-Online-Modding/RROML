@@ -359,22 +359,7 @@ namespace RROML.Core
 
             private Color GetAccentColor()
             {
-                if (_state == null)
-                {
-                    return Color.FromArgb(214, 110, 34);
-                }
-
-                if (_state.StatusKind == 1)
-                {
-                    return Color.FromArgb(214, 110, 34);
-                }
-
-                if (_state.StatusKind == 2)
-                {
-                    return Color.FromArgb(201, 84, 84);
-                }
-
-                return Color.FromArgb(232, 197, 72);
+                return Color.FromArgb(163, 59, 50);
             }
         }
 

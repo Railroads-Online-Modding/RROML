@@ -333,15 +333,7 @@ static bool RenderOverlayDX11(IDXGISwapChain* swapChain)
 
     ID2D1SolidColorBrush* textBrush = NULL;
     ID2D1SolidColorBrush* bgBrush = NULL;
-    D2D1_COLOR_F textColor = D2D1::ColorF(0.96f, 0.77f, 0.27f, 1.0f);
-    if (statusKind == 1)
-    {
-        textColor = D2D1::ColorF(0.44f, 0.79f, 0.47f, 1.0f);
-    }
-    else if (statusKind == 2)
-    {
-        textColor = D2D1::ColorF(0.86f, 0.37f, 0.37f, 1.0f);
-    }
+    D2D1_COLOR_F textColor = D2D1::ColorF(0.639f, 0.231f, 0.196f, 1.0f);
 
     renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.10f, 0.82f), &bgBrush);
     renderTarget->CreateSolidColorBrush(textColor, &textBrush);
@@ -541,15 +533,7 @@ static bool RenderOverlayDX12(IDXGISwapChain* swapChain)
     g_renderer.d2dContext->SetTarget(g_renderer.d2dBitmaps[index]);
     g_renderer.d2dContext->BeginDraw();
 
-    D2D1_COLOR_F textColor = D2D1::ColorF(0.96f, 0.77f, 0.27f, 1.0f);
-    if (statusKind == 1)
-    {
-        textColor = D2D1::ColorF(0.44f, 0.79f, 0.47f, 1.0f);
-    }
-    else if (statusKind == 2)
-    {
-        textColor = D2D1::ColorF(0.86f, 0.37f, 0.37f, 1.0f);
-    }
+    D2D1_COLOR_F textColor = D2D1::ColorF(0.639f, 0.231f, 0.196f, 1.0f);
 
     if (g_renderer.d2dBrush != NULL)
     {
