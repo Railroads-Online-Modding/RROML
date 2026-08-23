@@ -72,9 +72,20 @@ namespace RROML.Core
                 var loader = new ModLoader(config, logger, gameRoot, loaderPath, modsPath);
                 logger.Info("Starting mod load pass.");
                 var summary = loader.LoadAll();
-                logger.Info("Mod load pass finished. Candidates=" + summary.CandidateCount + ", Loaded=" + summary.LoadedModCount + ", Failed=" + summary.FailedModCount);
+                logger.Info("Mod load pass finished. Candidates=" + summary.CandidateCount + ", Loaded=" + summary.LoadedModCount + ", Failed=" + summary.FailedModCount + ", Warnings=" + logger.WarnCount);
                 logger.Info("RROML bootstrap finished.");
-                TryShowOverlay(logger, config, delegate { StatusOverlay.ShowSuccess(config, summary.LoadedModCount); }, "show success overlay");
+                if (summary.FailedModCount > 0 || logger.ErrorCount > 0)
+                {
+                    TryShowOverlay(logger, config, delegate { StatusOverlay.ShowFailure(config); }, "show failure overlay");
+                }
+                else if (logger.WarnCount > 0)
+                {
+                    TryShowOverlay(logger, config, delegate { StatusOverlay.ShowWarning(config, summary.LoadedModCount); }, "show warning overlay");
+                }
+                else
+                {
+                    TryShowOverlay(logger, config, delegate { StatusOverlay.ShowSuccess(config, summary.LoadedModCount); }, "show success overlay");
+                }
             }
             catch (Exception exception)
             {

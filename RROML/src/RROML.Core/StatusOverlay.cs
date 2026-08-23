@@ -66,6 +66,16 @@ namespace RROML.Core
             Publish("RROML Failed to Load", 2, config, 6000);
         }
 
+        public static void ShowWarning(LoaderConfig config, int loadedModCount)
+        {
+            if (config == null || !config.ShowOverlay)
+            {
+                return;
+            }
+
+            Publish("RROML Loaded with Warnings, " + loadedModCount + " mods loaded.", 3, config, 5000);
+        }
+
         private static void Publish(string message, int statusKind, LoaderConfig config, int autoHideMs)
         {
             OverlayHost host;
@@ -359,7 +369,22 @@ namespace RROML.Core
 
             private Color GetAccentColor()
             {
-                return Color.FromArgb(163, 59, 50);
+                if (_state == null)
+                {
+                    return Color.FromArgb(214, 110, 34);
+                }
+
+                if (_state.StatusKind == 2)
+                {
+                    return Color.FromArgb(201, 84, 84);
+                }
+
+                if (_state.StatusKind == 3)
+                {
+                    return Color.FromArgb(232, 197, 72);
+                }
+
+                return Color.FromArgb(214, 110, 34);
             }
         }
 

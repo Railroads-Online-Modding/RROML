@@ -9,6 +9,11 @@ namespace RROML.Core
     {
         private readonly object _gate;
         private readonly string _logPath;
+        private int _warnCount;
+        private int _errorCount;
+
+        public int WarnCount { get { lock (_gate) { return _warnCount; } } }
+        public int ErrorCount { get { lock (_gate) { return _errorCount; } } }
 
         public FileLogger(string logPath)
         {
@@ -23,16 +28,19 @@ namespace RROML.Core
 
         public void Warn(string message)
         {
+            lock (_gate) { _warnCount++; }
             Write("WARN", message, null);
         }
 
         public void Error(string message)
         {
+            lock (_gate) { _errorCount++; }
             Write("ERROR", message, null);
         }
 
         public void Error(string message, Exception exception)
         {
+            lock (_gate) { _errorCount++; }
             Write("ERROR", message, exception);
         }
 
