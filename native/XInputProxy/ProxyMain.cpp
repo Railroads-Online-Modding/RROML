@@ -2,10 +2,12 @@
 #include <metahost.h>
 #include <dxgi1_4.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
+#include <d3dcompiler.h>
 #include <strsafe.h>
 #include <mmsystem.h>
 #include <string.h>
@@ -31,6 +33,7 @@ typedef DWORD (WINAPI *TimeGetTimeFn)(void);
 
 typedef HRESULT (WINAPI *CreateDXGIFactoryFn)(REFIID, void**);
 typedef HRESULT (WINAPI *CreateDXGIFactory2Fn)(UINT, REFIID, void**);
+typedef HRESULT (WINAPI *D3DCompileFn)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
 typedef HRESULT (STDMETHODCALLTYPE *FactoryCreateSwapChainFn)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 typedef HRESULT (STDMETHODCALLTYPE *FactoryCreateSwapChainForHwndFn)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 typedef HRESULT (STDMETHODCALLTYPE *FactoryCreateSwapChainForCompositionFn)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
@@ -54,6 +57,19 @@ struct OverlayRenderer
     IDWriteTextFormat* textFormat;
     ID3D11Device* d3d11Device;
     ID3D11DeviceContext* d3d11Context;
+    ID3D11Texture2D* overlayTexture;
+    ID3D11ShaderResourceView* overlayTextureView;
+    ID2D1RenderTarget* overlayD2dTarget;
+    ID2D1SolidColorBrush* overlayBgBrush;
+    ID2D1SolidColorBrush* overlayTextBrush;
+    ID3D11VertexShader* overlayVertexShader;
+    ID3D11PixelShader* overlayPixelShader;
+    ID3D11InputLayout* overlayInputLayout;
+    ID3D11Buffer* overlayVertexBuffer;
+    ID3D11Buffer* overlayConstants;
+    ID3D11SamplerState* overlaySampler;
+    ID3D11BlendState* overlayBlendState;
+    ID3D11RasterizerState* overlayRasterizerState;
     ID3D12CommandQueue* d3d12Queue;
     ID3D12Device* d3d12Device;
     ID3D11On12Device* d3d11On12;
@@ -66,7 +82,38 @@ struct OverlayRenderer
     ID2D1Bitmap1* d2dBitmaps[8];
 };
 
+struct D3D11StateBackup
+{
+    ID3D11RenderTargetView* renderTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView* depthView;
+    ID3D11BlendState* blendState;
+    FLOAT blendFactor[4];
+    UINT sampleMask;
+    ID3D11DepthStencilState* depthState;
+    UINT stencilRef;
+    ID3D11RasterizerState* rasterizerState;
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT viewportCount;
+    ID3D11InputLayout* inputLayout;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    ID3D11Buffer* vertexBuffer;
+    UINT vertexStride;
+    UINT vertexOffset;
+    ID3D11VertexShader* vertexShader;
+    ID3D11HullShader* hullShader;
+    ID3D11DomainShader* domainShader;
+    ID3D11GeometryShader* geometryShader;
+    ID3D11PixelShader* pixelShader;
+    ID3D11Buffer* vertexConstants;
+    ID3D11ShaderResourceView* pixelResource;
+    ID3D11SamplerState* pixelSampler;
+    ID3D11Predicate* predicate;
+    BOOL predicateValue;
+};
+
 static HMODULE g_realXInput = NULL;
+static HMODULE g_d3dCompiler = NULL;
+static D3DCompileFn g_d3dCompile = NULL;
 static XInputGetStateFn g_xinputGetState = NULL;
 static XInputSetStateFn g_xinputSetState = NULL;
 static XInputGetCapabilitiesFn g_xinputGetCapabilities = NULL;
@@ -80,6 +127,11 @@ static XInputUnusedOrdinalFn g_xinputOrdinal102 = NULL;
 static XInputUnusedOrdinalFn g_xinputOrdinal103 = NULL;
 static LONG g_bootstrapStarted = 0;
 static LONG g_dxgiHookInstalled = 0;
+static LONG g_presentHookLogged = 0;
+static LONG g_overlayRenderFailureLogged = 0;
+static LONG g_overlayStateLogged = 0;
+static CRITICAL_SECTION g_rendererLock;
+static LONG g_rendererLockReady = 0;
 static CRITICAL_SECTION g_overlayLock;
 static LONG g_overlayLockReady = 0;
 static wchar_t g_overlayText[256] = L"";
@@ -115,6 +167,8 @@ static DWORD g_tickBaseReal = 0;
 static DWORD g_tickBaseVirtual = 0;
 static DWORD g_timeGetBaseReal = 0;
 static DWORD g_timeGetBaseVirtual = 0;
+
+static bool ResolveOverlayState(wchar_t* text, int* statusKind, int* position);
 template <typename T>
 static void SafeRelease(T** value)
 {
@@ -125,11 +179,79 @@ static void SafeRelease(T** value)
     }
 }
 
+static void CaptureD3D11State(ID3D11DeviceContext* context, D3D11StateBackup* state)
+{
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, state->renderTargets, &state->depthView);
+    context->OMGetBlendState(&state->blendState, state->blendFactor, &state->sampleMask);
+    context->OMGetDepthStencilState(&state->depthState, &state->stencilRef);
+    context->RSGetState(&state->rasterizerState);
+    state->viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetViewports(&state->viewportCount, state->viewports);
+    context->IAGetInputLayout(&state->inputLayout);
+    context->IAGetPrimitiveTopology(&state->topology);
+    context->IAGetVertexBuffers(0, 1, &state->vertexBuffer, &state->vertexStride, &state->vertexOffset);
+    context->VSGetShader(&state->vertexShader, NULL, NULL);
+    context->HSGetShader(&state->hullShader, NULL, NULL);
+    context->DSGetShader(&state->domainShader, NULL, NULL);
+    context->GSGetShader(&state->geometryShader, NULL, NULL);
+    context->PSGetShader(&state->pixelShader, NULL, NULL);
+    context->VSGetConstantBuffers(0, 1, &state->vertexConstants);
+    context->PSGetShaderResources(0, 1, &state->pixelResource);
+    context->PSGetSamplers(0, 1, &state->pixelSampler);
+    context->GetPredication(&state->predicate, &state->predicateValue);
+}
+
+static void RestoreD3D11State(ID3D11DeviceContext* context, D3D11StateBackup* state)
+{
+    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, state->renderTargets, state->depthView);
+    context->OMSetBlendState(state->blendState, state->blendFactor, state->sampleMask);
+    context->OMSetDepthStencilState(state->depthState, state->stencilRef);
+    context->RSSetState(state->rasterizerState);
+    context->RSSetViewports(state->viewportCount, state->viewports);
+    context->IASetInputLayout(state->inputLayout);
+    context->IASetPrimitiveTopology(state->topology);
+    context->IASetVertexBuffers(0, 1, &state->vertexBuffer, &state->vertexStride, &state->vertexOffset);
+    context->VSSetShader(state->vertexShader, NULL, 0);
+    context->HSSetShader(state->hullShader, NULL, 0);
+    context->DSSetShader(state->domainShader, NULL, 0);
+    context->GSSetShader(state->geometryShader, NULL, 0);
+    context->PSSetShader(state->pixelShader, NULL, 0);
+    context->VSSetConstantBuffers(0, 1, &state->vertexConstants);
+    context->PSSetShaderResources(0, 1, &state->pixelResource);
+    context->PSSetSamplers(0, 1, &state->pixelSampler);
+    context->SetPredication(state->predicate, state->predicateValue);
+
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) SafeRelease(&state->renderTargets[i]);
+    SafeRelease(&state->depthView);
+    SafeRelease(&state->blendState);
+    SafeRelease(&state->depthState);
+    SafeRelease(&state->rasterizerState);
+    SafeRelease(&state->inputLayout);
+    SafeRelease(&state->vertexBuffer);
+    SafeRelease(&state->vertexShader);
+    SafeRelease(&state->hullShader);
+    SafeRelease(&state->domainShader);
+    SafeRelease(&state->geometryShader);
+    SafeRelease(&state->pixelShader);
+    SafeRelease(&state->vertexConstants);
+    SafeRelease(&state->pixelResource);
+    SafeRelease(&state->pixelSampler);
+    SafeRelease(&state->predicate);
+}
+
 static void EnsureOverlayLock()
 {
     if (InterlockedCompareExchange(&g_overlayLockReady, 1, 0) == 0)
     {
         InitializeCriticalSection(&g_overlayLock);
+    }
+}
+
+static void EnsureRendererLock()
+{
+    if (InterlockedCompareExchange(&g_rendererLockReady, 1, 0) == 0)
+    {
+        InitializeCriticalSection(&g_rendererLock);
     }
 }
 
@@ -155,6 +277,13 @@ static void WriteProxyLog(const wchar_t* message)
     WriteFile(file, message, lstrlenW(message) * sizeof(wchar_t), &ignored, NULL);
     WriteFile(file, L"\r\n", 4, &ignored, NULL);
     CloseHandle(file);
+}
+
+static void WriteProxyHresult(const wchar_t* operation, HRESULT hr)
+{
+    wchar_t message[256];
+    StringCchPrintfW(message, 256, L"%s failed with HRESULT 0x%08X.", operation, (unsigned int)hr);
+    WriteProxyLog(message);
 }
 
 static void GetManagedAssemblyPath(wchar_t* buffer)
@@ -215,6 +344,19 @@ static void ResetRendererResources()
     SafeRelease(&g_renderer.d3d12Queue);
     SafeRelease(&g_renderer.d3d12Device);
     SafeRelease(&g_renderer.d3d11Context);
+    SafeRelease(&g_renderer.overlayTexture);
+    SafeRelease(&g_renderer.overlayTextureView);
+    SafeRelease(&g_renderer.overlayD2dTarget);
+    SafeRelease(&g_renderer.overlayBgBrush);
+    SafeRelease(&g_renderer.overlayTextBrush);
+    SafeRelease(&g_renderer.overlayVertexShader);
+    SafeRelease(&g_renderer.overlayPixelShader);
+    SafeRelease(&g_renderer.overlayInputLayout);
+    SafeRelease(&g_renderer.overlayVertexBuffer);
+    SafeRelease(&g_renderer.overlayConstants);
+    SafeRelease(&g_renderer.overlaySampler);
+    SafeRelease(&g_renderer.overlayBlendState);
+    SafeRelease(&g_renderer.overlayRasterizerState);
     SafeRelease(&g_renderer.d3d11Device);
     SafeRelease(&g_renderer.textFormat);
     SafeRelease(&g_renderer.writeFactory);
@@ -279,6 +421,10 @@ static bool ResolveOverlayState(wchar_t* text, int* statusKind, int* position)
     *statusKind = g_overlayStatusKind;
     *position = g_overlayPosition;
     LeaveCriticalSection(&g_overlayLock);
+    if (text[0] != L'\0' && InterlockedCompareExchange(&g_overlayStateLogged, 1, 0) == 0)
+    {
+        WriteProxyLog(L"DXGI Present observed active RROML overlay state.");
+    }
     return text[0] != L'\0';
 }
 
@@ -294,77 +440,227 @@ static void FillOverlayRect(float width, float* left, float* top, float* right, 
         *left = *right - 480.0f;
     }
 }
+static bool EnsureDX11OverlayResources(IDXGISwapChain* swapChain, UINT width, UINT height)
+{
+    if (g_renderer.overlayTexture != NULL)
+    {
+        return g_renderer.overlayD2dTarget != NULL && g_renderer.overlayBgBrush != NULL && g_renderer.overlayTextBrush != NULL &&
+            g_renderer.overlayInputLayout != NULL && g_renderer.overlayVertexBuffer != NULL && g_renderer.overlayConstants != NULL &&
+            g_renderer.overlayVertexShader != NULL && g_renderer.overlayPixelShader != NULL && g_renderer.overlaySampler != NULL &&
+            g_renderer.overlayBlendState != NULL && g_renderer.overlayRasterizerState != NULL;
+    }
+
+    if (!EnsureFactories()) return false;
+
+    D3D11_TEXTURE2D_DESC textureDesc = {};
+    textureDesc.Width = 500;
+    textureDesc.Height = 64;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = g_renderer.d3d11Device->CreateTexture2D(&textureDesc, NULL, &g_renderer.overlayTexture);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay texture", hr); return false; }
+    hr = g_renderer.d3d11Device->CreateShaderResourceView(g_renderer.overlayTexture, NULL, &g_renderer.overlayTextureView);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay texture view", hr); return false; }
+
+    IDXGISurface* surface = NULL;
+    hr = g_renderer.overlayTexture->QueryInterface(__uuidof(IDXGISurface), (void**)&surface);
+    if (FAILED(hr)) { WriteProxyHresult(L"Get overlay texture surface", hr); return false; }
+    D2D1_RENDER_TARGET_PROPERTIES targetProperties = {};
+    targetProperties.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+    targetProperties.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    targetProperties.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    targetProperties.dpiX = 96.0f;
+    targetProperties.dpiY = 96.0f;
+    ID2D1RenderTarget* target = NULL;
+    hr = g_renderer.d2dFactory->CreateDxgiSurfaceRenderTarget(surface, &targetProperties, &target);
+    surface->Release();
+    if (FAILED(hr)) { WriteProxyHresult(L"Create compatible overlay render target", hr); return false; }
+    g_renderer.overlayD2dTarget = target;
+    g_renderer.overlayD2dTarget->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.10f, 0.82f), &g_renderer.overlayBgBrush);
+    g_renderer.overlayD2dTarget->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &g_renderer.overlayTextBrush);
+    if (g_renderer.overlayBgBrush == NULL || g_renderer.overlayTextBrush == NULL)
+    {
+        WriteProxyLog(L"Could not create overlay text brushes.");
+        return false;
+    }
+
+    static const char* shader =
+        "struct V { float2 p : POSITION; float2 uv : TEXCOORD0; };"
+        "struct O { float4 p : SV_POSITION; float2 uv : TEXCOORD0; };"
+        "cbuffer C : register(b0) { float4 rect; float2 screen; float2 pad; };"
+        "O vs(V i) { O o; float2 pixel=rect.xy+i.p*rect.zw; o.p=float4(pixel.x/screen.x*2-1, 1-pixel.y/screen.y*2, 0, 1); o.uv=i.uv; return o; }"
+        "Texture2D t : register(t0); SamplerState s : register(s0);"
+        "float4 ps(O i) : SV_TARGET { return t.Sample(s, i.uv); }";
+    ID3DBlob* vsCode = NULL;
+    ID3DBlob* psCode = NULL;
+    ID3DBlob* errors = NULL;
+    if (g_d3dCompile == NULL)
+    {
+        g_d3dCompiler = LoadLibraryW(L"D3DCOMPILER_47.dll");
+        if (g_d3dCompiler != NULL) g_d3dCompile = (D3DCompileFn)GetProcAddress(g_d3dCompiler, "D3DCompile");
+    }
+    if (g_d3dCompile == NULL) { WriteProxyLog(L"The Windows Direct3D shader compiler is unavailable."); return false; }
+    hr = g_d3dCompile(shader, strlen(shader), NULL, NULL, NULL, "vs", "vs_4_0", 0, 0, &vsCode, &errors);
+    if (FAILED(hr)) { if (errors) errors->Release(); WriteProxyHresult(L"Compile overlay vertex shader", hr); return false; }
+    hr = g_d3dCompile(shader, strlen(shader), NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &psCode, &errors);
+    if (FAILED(hr)) { SafeRelease(&vsCode); if (errors) errors->Release(); WriteProxyHresult(L"Compile overlay pixel shader", hr); return false; }
+    hr = g_renderer.d3d11Device->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), NULL, &g_renderer.overlayVertexShader);
+    if (SUCCEEDED(hr)) hr = g_renderer.d3d11Device->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), NULL, &g_renderer.overlayPixelShader);
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
+    if (SUCCEEDED(hr)) hr = g_renderer.d3d11Device->CreateInputLayout(layout, 2, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), &g_renderer.overlayInputLayout);
+    SafeRelease(&vsCode);
+    SafeRelease(&psCode);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay shaders", hr); return false; }
+
+    D3D11_BUFFER_DESC bufferDesc = {};
+    bufferDesc.ByteWidth = 6 * sizeof(float) * 4;
+    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_renderer.d3d11Device->CreateBuffer(&bufferDesc, NULL, &g_renderer.overlayVertexBuffer);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay vertex buffer", hr); return false; }
+
+    D3D11_BUFFER_DESC constantsDesc = {};
+    constantsDesc.ByteWidth = 32;
+    constantsDesc.Usage = D3D11_USAGE_DYNAMIC;
+    constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    constantsDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_renderer.d3d11Device->CreateBuffer(&constantsDesc, NULL, &g_renderer.overlayConstants);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay constants", hr); return false; }
+
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    hr = g_renderer.d3d11Device->CreateSamplerState(&samplerDesc, &g_renderer.overlaySampler);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay sampler", hr); return false; }
+
+    D3D11_BLEND_DESC blendDesc = {};
+    blendDesc.RenderTarget[0].BlendEnable = TRUE;
+    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = g_renderer.d3d11Device->CreateBlendState(&blendDesc, &g_renderer.overlayBlendState);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay blend state", hr); return false; }
+
+    D3D11_RASTERIZER_DESC rasterDesc = {};
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    rasterDesc.DepthClipEnable = TRUE;
+    hr = g_renderer.d3d11Device->CreateRasterizerState(&rasterDesc, &g_renderer.overlayRasterizerState);
+    if (FAILED(hr)) { WriteProxyHresult(L"Create overlay rasterizer", hr); return false; }
+
+    (void)swapChain;
+    (void)width;
+    (void)height;
+    return true;
+}
+
 static bool RenderOverlayDX11(IDXGISwapChain* swapChain)
 {
     wchar_t text[256];
     int statusKind = 0;
     int position = 0;
-    if (!ResolveOverlayState(text, &statusKind, &position))
+    if (!ResolveOverlayState(text, &statusKind, &position)) return true;
+
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    if (FAILED(swapChain->GetDesc(&desc))) return false;
+    UINT bufferIndex = 0;
+    if (g_renderer.swapChain3 == NULL)
     {
-        return true;
+        swapChain->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&g_renderer.swapChain3);
     }
+    if (g_renderer.swapChain3 != NULL) bufferIndex = g_renderer.swapChain3->GetCurrentBackBufferIndex();
+    ID3D11Texture2D* backBuffer = NULL;
+    HRESULT hr = swapChain->GetBuffer(bufferIndex, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
+    if (FAILED(hr) || backBuffer == NULL) { WriteProxyHresult(L"Get current swap-chain buffer", hr); return false; }
+    D3D11_TEXTURE2D_DESC backBufferDesc = {};
+    backBuffer->GetDesc(&backBufferDesc);
+    if (!EnsureDX11OverlayResources(swapChain, backBufferDesc.Width, backBufferDesc.Height)) { backBuffer->Release(); return false; }
+    ID3D11RenderTargetView* targetView = NULL;
+    hr = g_renderer.d3d11Device->CreateRenderTargetView(backBuffer, NULL, &targetView);
+    backBuffer->Release();
+    if (FAILED(hr)) { WriteProxyHresult(L"Create current backbuffer view", hr); return false; }
 
-    if (!EnsureFactories())
-    {
-        return false;
-    }
+    D3D11StateBackup previousState = {};
+    CaptureD3D11State(g_renderer.d3d11Context, &previousState);
+    g_renderer.d3d11Context->SetPredication(NULL, FALSE);
 
-    IDXGISurface* surface = NULL;
-    HRESULT hr = swapChain->GetBuffer(0, __uuidof(IDXGISurface), (void**)&surface);
-    if (FAILED(hr) || surface == NULL)
-    {
-        return false;
-    }
-
-    D2D1_RENDER_TARGET_PROPERTIES properties = {};
-    properties.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-    properties.pixelFormat.format = DXGI_FORMAT_UNKNOWN;
-    properties.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    properties.usage = D2D1_RENDER_TARGET_USAGE_NONE;
-    properties.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
-
-    ID2D1RenderTarget* renderTarget = NULL;
-    hr = g_renderer.d2dFactory->CreateDxgiSurfaceRenderTarget(surface, &properties, &renderTarget);
-    SafeRelease(&surface);
-    if (FAILED(hr) || renderTarget == NULL)
-    {
-        return false;
-    }
-
-    ID2D1SolidColorBrush* textBrush = NULL;
-    ID2D1SolidColorBrush* bgBrush = NULL;
     D2D1_COLOR_F textColor = D2D1::ColorF(0.839f, 0.431f, 0.133f, 1.0f);
-    if (statusKind == 2)
+    if (statusKind == 1) textColor = D2D1::ColorF(0.439f, 0.804f, 0.486f, 1.0f);
+    else if (statusKind == 2) textColor = D2D1::ColorF(0.788f, 0.329f, 0.329f, 1.0f);
+    else if (statusKind == 3) textColor = D2D1::ColorF(0.910f, 0.773f, 0.282f, 1.0f);
+    g_renderer.overlayTextBrush->SetColor(textColor);
+    g_renderer.overlayD2dTarget->BeginDraw();
+    g_renderer.overlayD2dTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+    D2D1_RECT_F box = D2D1::RectF(0, 0, 500, 64);
+    D2D1_RECT_F label = D2D1::RectF(14, 0, 486, 64);
+    g_renderer.overlayD2dTarget->FillRectangle(box, g_renderer.overlayBgBrush);
+    g_renderer.overlayD2dTarget->DrawText(text, (UINT32)lstrlenW(text), g_renderer.textFormat, label, g_renderer.overlayTextBrush);
+    hr = g_renderer.overlayD2dTarget->EndDraw();
+    if (FAILED(hr))
     {
-        textColor = D2D1::ColorF(0.788f, 0.329f, 0.329f, 1.0f);
-    }
-    else if (statusKind == 3)
-    {
-        textColor = D2D1::ColorF(0.910f, 0.773f, 0.282f, 1.0f);
-    }
-
-    renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.10f, 0.82f), &bgBrush);
-    renderTarget->CreateSolidColorBrush(textColor, &textBrush);
-    renderTarget->BeginDraw();
-
-    D2D1_SIZE_F size = renderTarget->GetSize();
-    float left, top, right, bottom;
-    FillOverlayRect(size.width, &left, &top, &right, &bottom, position);
-    D2D1_RECT_F boxRect = D2D1::RectF(left, top, right, bottom);
-    D2D1_RECT_F textRect = D2D1::RectF(left + 14.0f, top, right - 14.0f, bottom);
-    if (bgBrush != NULL)
-    {
-        renderTarget->FillRectangle(boxRect, bgBrush);
-    }
-    if (textBrush != NULL)
-    {
-        renderTarget->DrawText(text, (UINT32)lstrlenW(text), g_renderer.textFormat, textRect, textBrush);
+        WriteProxyHresult(L"Draw overlay text", hr);
+        RestoreD3D11State(g_renderer.d3d11Context, &previousState);
+        targetView->Release();
+        return false;
     }
 
-    hr = renderTarget->EndDraw();
-    SafeRelease(&bgBrush);
-    SafeRelease(&textBrush);
-    SafeRelease(&renderTarget);
+    struct OverlayVertex { float x, y, u, v; };
+    float left = position == 1 ? (float)backBufferDesc.Width - 520.0f : 20.0f;
+    float top = 20.0f;
+    OverlayVertex vertices[6] = {
+        { 0, 0, 0, 0 }, { 1, 0, 1, 0 }, { 0, 1, 0, 1 },
+        { 0, 1, 0, 1 }, { 1, 0, 1, 0 }, { 1, 1, 1, 1 }
+    };
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = g_renderer.d3d11Context->Map(g_renderer.overlayVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        memcpy(mapped.pData, vertices, sizeof(vertices));
+        g_renderer.d3d11Context->Unmap(g_renderer.overlayVertexBuffer, 0);
+        float screenConstants[8] = { left, top, 500.0f, 64.0f, (float)backBufferDesc.Width, (float)backBufferDesc.Height, 0, 0 };
+        if (SUCCEEDED(g_renderer.d3d11Context->Map(g_renderer.overlayConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            memcpy(mapped.pData, screenConstants, sizeof(screenConstants));
+            g_renderer.d3d11Context->Unmap(g_renderer.overlayConstants, 0);
+        }
+        UINT stride = sizeof(OverlayVertex), offset = 0;
+        g_renderer.d3d11Context->OMSetRenderTargets(1, &targetView, NULL);
+        D3D11_VIEWPORT viewport = { 0, 0, (float)backBufferDesc.Width, (float)backBufferDesc.Height, 0, 1 };
+        g_renderer.d3d11Context->RSSetViewports(1, &viewport);
+        g_renderer.d3d11Context->RSSetState(g_renderer.overlayRasterizerState);
+        g_renderer.d3d11Context->OMSetBlendState(g_renderer.overlayBlendState, NULL, 0xffffffff);
+        g_renderer.d3d11Context->IASetInputLayout(g_renderer.overlayInputLayout);
+        g_renderer.d3d11Context->IASetVertexBuffers(0, 1, &g_renderer.overlayVertexBuffer, &stride, &offset);
+        g_renderer.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_renderer.d3d11Context->VSSetShader(g_renderer.overlayVertexShader, NULL, 0);
+        g_renderer.d3d11Context->VSSetConstantBuffers(0, 1, &g_renderer.overlayConstants);
+        g_renderer.d3d11Context->PSSetShader(g_renderer.overlayPixelShader, NULL, 0);
+        g_renderer.d3d11Context->PSSetShaderResources(0, 1, &g_renderer.overlayTextureView);
+        g_renderer.d3d11Context->PSSetSamplers(0, 1, &g_renderer.overlaySampler);
+        g_renderer.d3d11Context->Draw(6, 0);
+        ID3D11ShaderResourceView* emptyView = NULL;
+        g_renderer.d3d11Context->PSSetShaderResources(0, 1, &emptyView);
+    }
+    else
+    {
+        WriteProxyHresult(L"Map overlay vertex buffer", hr);
+    }
+
+    RestoreD3D11State(g_renderer.d3d11Context, &previousState);
+    targetView->Release();
     return SUCCEEDED(hr);
 }
 
@@ -583,19 +879,29 @@ static bool RenderOverlayDX12(IDXGISwapChain* swapChain)
 
 static void RenderOverlayIfPossible(IDXGISwapChain* swapChain)
 {
+    EnsureRendererLock();
+    EnterCriticalSection(&g_rendererLock);
     if (g_renderer.swapChain == NULL || g_renderer.swapChain != swapChain)
     {
+        LeaveCriticalSection(&g_rendererLock);
         return;
     }
 
     if (g_renderer.backend == OverlayBackend_DX11)
     {
-        RenderOverlayDX11(swapChain);
+        if (!RenderOverlayDX11(swapChain) && InterlockedCompareExchange(&g_overlayRenderFailureLogged, 1, 0) == 0)
+        {
+            WriteProxyLog(L"DX11 in-game overlay rendering failed.");
+        }
     }
     else if (g_renderer.backend == OverlayBackend_DX12)
     {
-        RenderOverlayDX12(swapChain);
+        if (!RenderOverlayDX12(swapChain) && InterlockedCompareExchange(&g_overlayRenderFailureLogged, 1, 0) == 0)
+        {
+            WriteProxyLog(L"DX12 overlay rendering failed.");
+        }
     }
+    LeaveCriticalSection(&g_rendererLock);
 }
 
 static void InitializeSwapChainRenderer(IDXGISwapChain* swapChain, IUnknown* deviceArg)
@@ -605,8 +911,11 @@ static void InitializeSwapChainRenderer(IDXGISwapChain* swapChain, IUnknown* dev
         return;
     }
 
+    EnsureRendererLock();
+    EnterCriticalSection(&g_rendererLock);
     if (g_renderer.swapChain == swapChain)
     {
+        LeaveCriticalSection(&g_rendererLock);
         return;
     }
 
@@ -626,6 +935,7 @@ static void InitializeSwapChainRenderer(IDXGISwapChain* swapChain, IUnknown* dev
         g_renderer.d3d11Device = probe11;
         g_renderer.d3d11Device->GetImmediateContext(&g_renderer.d3d11Context);
         WriteProxyLog(L"RROML overlay detected DX11.");
+        LeaveCriticalSection(&g_rendererLock);
         return;
     }
     SafeRelease(&probe11);
@@ -637,11 +947,13 @@ static void InitializeSwapChainRenderer(IDXGISwapChain* swapChain, IUnknown* dev
         g_renderer.d3d12Queue = probeQueue;
         g_renderer.d3d12Queue->GetDevice(__uuidof(ID3D12Device), (void**)&g_renderer.d3d12Device);
         WriteProxyLog(L"RROML overlay detected DX12.");
+        LeaveCriticalSection(&g_rendererLock);
         return;
     }
     SafeRelease(&probeQueue);
 
     WriteProxyLog(L"RROML overlay could not determine DX11 or DX12 backend.");
+    LeaveCriticalSection(&g_rendererLock);
 }
 
 static void PatchVTableEntry(void** vtable, int index, void* replacement, void** original)
@@ -666,12 +978,20 @@ static void PatchVTableEntry(void** vtable, int index, void* replacement, void**
 
 static HRESULT STDMETHODCALLTYPE Hook_SwapChainPresent(IDXGISwapChain* self, UINT syncInterval, UINT flags)
 {
+    if (InterlockedCompareExchange(&g_presentHookLogged, 1, 0) == 0)
+    {
+        WriteProxyLog(L"DXGI swap-chain Present hook reached.");
+    }
     RenderOverlayIfPossible(self);
     return g_realSwapChainPresent != NULL ? g_realSwapChainPresent(self, syncInterval, flags) : S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_SwapChainPresent1(IDXGISwapChain1* self, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters)
 {
+    if (InterlockedCompareExchange(&g_presentHookLogged, 1, 0) == 0)
+    {
+        WriteProxyLog(L"DXGI swap-chain Present1 hook reached.");
+    }
     RenderOverlayIfPossible(self);
     return g_realSwapChainPresent1 != NULL ? g_realSwapChainPresent1(self, syncInterval, flags, parameters) : S_OK;
 }
@@ -768,12 +1088,12 @@ static HRESULT WINAPI Hook_CreateDXGIFactory2(UINT flags, REFIID riid, void** fa
     return hr;
 }
 
-static void PatchImportAddress(const char* dllName, const char* importName, void* replacement, void** original)
+static bool PatchImportAddress(const char* dllName, const char* importName, void* replacement, void** original)
 {
     HMODULE module = GetModuleHandleW(NULL);
     if (module == NULL)
     {
-        return;
+        return false;
     }
 
     BYTE* base = (BYTE*)module;
@@ -782,7 +1102,7 @@ static void PatchImportAddress(const char* dllName, const char* importName, void
     IMAGE_DATA_DIRECTORY importDirectory = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDirectory.VirtualAddress == 0)
     {
-        return;
+        return false;
     }
 
     IMAGE_IMPORT_DESCRIPTOR* descriptor = (IMAGE_IMPORT_DESCRIPTOR*)(base + importDirectory.VirtualAddress);
@@ -819,10 +1139,13 @@ static void PatchImportAddress(const char* dllName, const char* importName, void
             {
                 thunk->u1.Function = (ULONG_PTR)replacement;
                 VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+                return true;
             }
-            return;
+            return false;
         }
     }
+
+    return false;
 }
 
 static void EnsureTimeLock()
@@ -1091,9 +1414,11 @@ static void InstallDxgiHooks()
     g_realCreateDXGIFactory = (CreateDXGIFactoryFn)GetProcAddress(dxgiModule, "CreateDXGIFactory");
     g_realCreateDXGIFactory1 = (CreateDXGIFactoryFn)GetProcAddress(dxgiModule, "CreateDXGIFactory1");
     g_realCreateDXGIFactory2 = (CreateDXGIFactory2Fn)GetProcAddress(dxgiModule, "CreateDXGIFactory2");
-    PatchImportAddress("dxgi.dll", "CreateDXGIFactory", (void*)Hook_CreateDXGIFactory, (void**)&g_realCreateDXGIFactory);
-    PatchImportAddress("dxgi.dll", "CreateDXGIFactory1", (void*)Hook_CreateDXGIFactory1, (void**)&g_realCreateDXGIFactory1);
-    PatchImportAddress("dxgi.dll", "CreateDXGIFactory2", (void*)Hook_CreateDXGIFactory2, (void**)&g_realCreateDXGIFactory2);
+    bool hooked = false;
+    hooked |= PatchImportAddress("dxgi.dll", "CreateDXGIFactory", (void*)Hook_CreateDXGIFactory, (void**)&g_realCreateDXGIFactory);
+    hooked |= PatchImportAddress("dxgi.dll", "CreateDXGIFactory1", (void*)Hook_CreateDXGIFactory1, (void**)&g_realCreateDXGIFactory1);
+    hooked |= PatchImportAddress("dxgi.dll", "CreateDXGIFactory2", (void*)Hook_CreateDXGIFactory2, (void**)&g_realCreateDXGIFactory2);
+    WriteProxyLog(hooked ? L"DXGI factory import hook installed." : L"No DXGI factory imports found in the game executable.");
 }
 
 static void StartManagedBootstrap()
@@ -1994,8 +2319,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         EnsureOverlayLock();
         EnsureTimeLock();
         LoadRealXInput();
+        InstallDxgiHooks();
         InstallTimeHooks();
-        WriteProxyLog(L"DXGI overlay hooks are disabled. Status is now written by managed RROML state.");
+        WriteProxyLog(L"DXGI in-game status overlay hooks installed.");
     }
     else if (reason == DLL_PROCESS_DETACH)
     {

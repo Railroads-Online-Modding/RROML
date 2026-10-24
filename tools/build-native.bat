@@ -3,6 +3,11 @@ setlocal
 
 set ROOT=%~dp0..
 set MINGW_BIN=D:\msys64\mingw64\bin
+if not exist "%MINGW_BIN%\g++.exe" set MINGW_BIN=C:\msys64\mingw64\bin
+if not exist "%MINGW_BIN%\g++.exe" (
+    for /f "delims=" %%I in ('where g++.exe 2^>nul') do if not defined MINGW_FOUND set MINGW_FOUND=%%~dpI
+    if defined MINGW_FOUND set MINGW_BIN=%MINGW_FOUND%
+)
 set GPP=%MINGW_BIN%\g++.exe
 set DLLTOOL=%MINGW_BIN%\dlltool.exe
 set INCLUDE_NETFX=C:\Program Files (x86)\Windows Kits\NETFXSDK\4.8.1\Include\um
