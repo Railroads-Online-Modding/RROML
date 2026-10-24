@@ -1,7 +1,0 @@
-{
-  "Id": "ExampleMod",
-  "Name": "Example Mod (C#)",
-  "Version": "1.0.0",
-  "EntryDll": "ExampleMod.dll",
-  "Dependencies": []
-}
