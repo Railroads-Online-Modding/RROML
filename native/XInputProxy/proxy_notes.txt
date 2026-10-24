@@ -1,0 +1,17 @@
+This folder is for the one native DLL that must sit next to arr-Win64-Shipping.exe.
+
+What it should do:
+1. Load the real system XINPUT1_3.dll from System32.
+2. Forward normal XInput exports to the real DLL.
+3. On process attach, start the managed RROML core by calling:
+   RROML.Core.Bootstrap.Initialize()
+
+Why this is not built here:
+- This workspace does not have a real native compiler/linker installed.
+- Old Windows csc.exe is present and used for the managed side only.
+
+Expected output after native build:
+- XINPUT1_3.dll
+
+Install target for that file:
+- Railroads Online\arr\Binaries\Win64\XINPUT1_3.dll

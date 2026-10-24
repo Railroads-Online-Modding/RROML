@@ -1,0 +1,36 @@
+LIBRARY XINPUT1_3
+EXPORTS
+    DllMain=ExportedDllMain @1
+    XInputGetState @2
+    XInputSetState @3
+    XInputGetCapabilities @4
+    XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation @7
+    XInputGetKeystroke @8
+    XInputGetStateEx @100 NONAME
+    XInputOrdinal101 @101 NONAME
+    XInputOrdinal102 @102 NONAME
+    XInputOrdinal103 @103 NONAME
+    RROML_SetOverlayStatusW
+    RROML_SetOverlayPosition
+    RROML_GetMainModuleInfo
+    RROML_ReadQword
+    RROML_ReadMemory
+    RROML_FindAsciiString
+    RROML_FindWideStringW
+    RROML_FindAddressValueRefs
+    RROML_FindRipRelativeCodeRefs
+    RROML_FindRipRelativeCodeRefsInRange
+    RROML_FindPatternA
+    RROML_ResolveRipRelativeTarget
+    RROML_FindLikelyFunctionStart
+    RROML_FindRipRelativeLeaXref
+    RROML_SetTimeScale
+    RROML_GetTimeScale
+
+
+
+
+
+
