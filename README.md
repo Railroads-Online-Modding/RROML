@@ -1,7 +1,6 @@
 # RROML
 
 [![Made With Kodo](https://raw.githubusercontent.com/Kodo-IDE/Kodo/main/made-with-kodo.svg)](https://github.com/Kodo-IDE/Kodo)
-
 ---
 
 > [!CAUTION]
