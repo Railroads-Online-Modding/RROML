@@ -2,6 +2,10 @@
 
 ---
 
+[![Made With Kodo](https://raw.githubusercontent.com/Kodo-IDE/Kodo/main/made-with-kodo.svg)](https://github.com/Kodo-IDE/Kodo)
+
+---
+
 > [!CAUTION]
 > RROML and mods may cause unexpected bugs or issues in multiplayer. Feel free to report said issues in the RROML GitHub repository Issues section. Please be sure to back up your saves before modding in multiplayer.
 
