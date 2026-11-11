@@ -97,4 +97,4 @@ Please look at the wiki first before asking for help in the Discord.
 
 **Licensing:**
 
-RROML is licensed under the [KPL-v1.1 license](LICENSE.md).
+RROML is licensed under the [Apache-2.0 License](LICENSE.md).
